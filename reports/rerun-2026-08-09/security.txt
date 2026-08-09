@@ -1,0 +1,7 @@
+# DigiScope security contact (RFC 9116)
+# Serve at: https://digiscope.me/.well-known/security.txt
+Contact: mailto:mark@aroundtheblock.us
+Expires: 2027-08-09T00:00:00.000Z
+Preferred-Languages: en
+Canonical: https://digiscope.me/.well-known/security.txt
+Policy: https://digiscope.me/security
