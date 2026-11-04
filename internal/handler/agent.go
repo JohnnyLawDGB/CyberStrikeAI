@@ -2401,6 +2401,32 @@ func (h *AgentHandler) nextBatchQueueRunAt(cronExpr string, from time.Time) (*ti
 	return &next, nil
 }
 
+// prepareManualBatchQueueStart makes an explicit manual start idempotent across
+// every idle terminal state. A completed/cancelled queue must be reset before it
+// can run again; doing that here keeps the transition under the executor guard
+// held by startBatchQueueExecution.
+func (h *AgentHandler) prepareManualBatchQueueStart(queueID string, queue *BatchTaskQueue) (*BatchTaskQueue, error) {
+	if queue == nil {
+		return nil, fmt.Errorf("队列不存在")
+	}
+
+	switch queue.Status {
+	case BatchQueueStatusPending, BatchQueueStatusPaused:
+		return queue, nil
+	case BatchQueueStatusCompleted, BatchQueueStatusCancelled:
+		if !h.batchTaskManager.ResetQueueForRerun(queueID) {
+			return nil, fmt.Errorf("重置队列失败")
+		}
+		refreshed, exists := h.batchTaskManager.GetBatchQueue(queueID)
+		if !exists || refreshed == nil {
+			return nil, fmt.Errorf("队列不存在")
+		}
+		return refreshed, nil
+	default:
+		return nil, fmt.Errorf("队列状态 %q 不允许启动", queue.Status)
+	}
+}
+
 func (h *AgentHandler) startBatchQueueExecution(queueID string, scheduled bool) (bool, error) {
 	// 先获取执行互斥门，再读取队列状态，避免基于过时快照做判断
 	if !h.batchTaskManager.TryMarkQueueExecutor(queueID) {
@@ -2433,9 +2459,13 @@ func (h *AgentHandler) startBatchQueueExecution(queueID string, scheduled bool) 
 			return true, err
 		}
 		queue, _ = h.batchTaskManager.GetBatchQueue(queueID)
-	} else if queue.Status != "pending" && queue.Status != "paused" {
-		h.batchTaskManager.UnmarkQueueExecutor(queueID)
-		return true, fmt.Errorf("队列状态不允许启动")
+	} else {
+		var err error
+		queue, err = h.prepareManualBatchQueueStart(queueID, queue)
+		if err != nil {
+			h.batchTaskManager.UnmarkQueueExecutor(queueID)
+			return true, err
+		}
 	}
 
 	if queue != nil && batchQueueWantsEino(queue.AgentMode) && (h.config == nil || !h.config.MultiAgent.Enabled) {

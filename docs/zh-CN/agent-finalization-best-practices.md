@@ -156,10 +156,10 @@ Do not produce a final answer until verification is complete.
    `RunResult.Response` 不能直接升级为最终回复，必须经过 `agentfinalizer.Decide`。
 
 2. **所有 `response` 事件必须携带终态字段。**
-   至少包含 `finalized`、`finalizable`、`status`、`completionReason`、`evidenceVerified`、`evidenceRefs`、`pendingExecutionIds`、`missingChecks`。
+   至少包含 `finalized`、`finalizable`、`status`、`completionReason`、`evidenceVerified`、`evidenceRefs`、`mcpExecutionIds`、`pendingExecutionIds`、`failedExecutionIds`、`missingChecks`。
 
 3. **未完成工具会阻断 final。**
-   `queued/running` 工具执行仍存在时，决策结果为 `in_progress/pending_tool_executions`。
+   `queued/running` 工具执行仍存在时，决策结果为 `in_progress/pending_tool_executions`；仅存在失败、拦截、取消、硬超时或孤儿执行时，决策结果为 `failed/execution_failed`，并保留失败 execution ID 供审计。只有当前轮次完全没有具体工具执行时才使用 `blocked/missing_execution_evidence`。
 
 4. **执行证据必须由结构化策略声明。**
    后端不从用户自然语言、助手回复或 agent mode 名称中推断执行意图。聊天请求通过 `finalization.requireExecutionEvidence` 显式声明；WebShell、Workflow、批量、机器人等执行入口由调用点显式传入 policy。policy 要求证据时，至少需要一个可查询到的 `completed` 工具执行记录；只有 failed/cancelled 记录不能支撑最终化。

@@ -94,7 +94,7 @@ func DefaultPlanExecuteOrchestratorInstruction() string {
 
 在消息中提供简短思考（约 50～200 字），包含：1) 当前测试目标与工具/步骤选择原因；2) 与上轮结果的衔接；3) 期望得到的证据形态。
 
-表达要求：✅ 用 **2～4 句**中文写清关键决策依据；❌ 不要只写一句话；❌ 不要超过 10 句话。
+表达要求：✅ 用与用户最新消息相同的语言写 **2～4 句**关键决策依据（无法判断时使用英文）；❌ 不要只写一句话；❌ 不要超过 10 句话。
 
 ## 工具调用失败时的原则
 
@@ -123,7 +123,7 @@ func DefaultPlanExecuteOrchestratorInstruction() string {
 
 ## 表达
 
-在调用工具或给出计划变更前，用 2～5 句中文说明当前决策依据与期望证据形态；最终对用户交付结构化结论（发现摘要、证据、风险、下一步）。
+在调用工具或给出计划变更前，用与用户最新消息相同的语言写 2～5 句，说明当前决策依据与期望证据形态；最终以相同语言向用户交付结构化结论（发现摘要、证据、风险、下一步）。
 
 ` + projectprompt.ShellExecExecuteGuidanceSection()
 }
@@ -222,7 +222,7 @@ func DefaultSupervisorOrchestratorInstruction() string {
 
 在消息中提供简短思考（约 50～200 字），包含：1) 当前子目标与工具/子代理选择原因；2) 与上文结果的衔接；3) 期望得到的交付物或证据。
 
-表达要求：✅ **2～4 句**中文、含关键决策依据；❌ 不要只写一句话；❌ 不要超过 10 句话。
+表达要求：✅ 用与用户最新消息相同的语言写 **2～4 句**并包含关键决策依据（无法判断时使用英文）；❌ 不要只写一句话；❌ 不要超过 10 句话。
 
 ## 工具调用失败时的原则
 
@@ -243,7 +243,7 @@ func DefaultSupervisorOrchestratorInstruction() string {
 
 ## 表达
 
-委派或调用工具前用简短中文说明子目标与理由；对用户回复结构清晰（结论、证据、不确定性、建议）。`
+委派或调用工具前用与用户最新消息相同的语言简短说明子目标与理由；对用户回复使用相同语言并保持结构清晰（结论、证据、不确定性、建议）。`
 }
 
 // resolveMainOrchestratorInstruction 按编排模式解析主代理系统提示与可选的 Markdown 元数据（name/description）。plan_execute / supervisor **不**回退到 Deep 的 orchestrator_instruction，避免混用提示词。

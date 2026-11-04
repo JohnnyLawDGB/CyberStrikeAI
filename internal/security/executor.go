@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"runtime"
@@ -34,6 +35,7 @@ var ToolOutputCallbackCtxKey = toolOutputCallbackCtxKey{}
 type Executor struct {
 	config                  *config.SecurityConfig
 	toolIndex               map[string]*config.ToolConfig // 工具索引，用于 O(1) 查找
+	unavailableCommands     map[string]string
 	mcpServer               *mcp.Server
 	logger                  *zap.Logger
 	shellNoOutputTimeoutSec int // execute/exec 无新输出空闲秒数；0=默认 300；-1=关闭（见 SetShellNoOutputTimeoutSeconds）
@@ -107,15 +109,160 @@ func (e *Executor) spillOptsFromContext(ctx context.Context) tooloutput.SpillOpt
 // buildToolIndex 构建工具索引，将 O(n) 查找优化为 O(1)
 func (e *Executor) buildToolIndex() {
 	e.toolIndex = make(map[string]*config.ToolConfig)
+	nextUnavailable := make(map[string]string)
 	for i := range e.config.Tools {
-		if e.config.Tools[i].Enabled {
-			e.toolIndex[e.config.Tools[i].Name] = &e.config.Tools[i]
+		toolConfig := &e.config.Tools[i]
+		if !toolConfig.Enabled {
+			continue
+		}
+		if _, err := resolveToolCommand(toolConfig.Command); err != nil {
+			signature := strings.TrimSpace(toolConfig.Command) + ": " + err.Error()
+			nextUnavailable[toolConfig.Name] = signature
+			if e.logger != nil && e.unavailableCommands[toolConfig.Name] != signature {
+				e.logger.Warn("跳过不可用的安全工具",
+					zap.String("tool", toolConfig.Name),
+					zap.String("command", toolConfig.Command),
+					zap.Error(err),
+				)
+			}
+			continue
+		}
+		e.toolIndex[toolConfig.Name] = toolConfig
+	}
+	e.unavailableCommands = nextUnavailable
+	if e.logger != nil {
+		e.logger.Debug("工具索引构建完成",
+			zap.Int("totalTools", len(e.config.Tools)),
+			zap.Int("availableTools", len(e.toolIndex)),
+		)
+	}
+}
+
+func resolveToolCommand(command string) (string, error) {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return "", fmt.Errorf("command is empty")
+	}
+	if strings.HasPrefix(command, "internal:") {
+		return command, nil
+	}
+	path, err := exec.LookPath(command)
+	if err != nil {
+		return "", fmt.Errorf("executable %q is not available on PATH: %w", command, err)
+	}
+	return path, nil
+}
+
+func validateToolArguments(toolConfig *config.ToolConfig, args map[string]interface{}) error {
+	if toolConfig == nil {
+		return fmt.Errorf("tool configuration is missing")
+	}
+	validated := make(map[string]struct{}, len(toolConfig.Parameters))
+	for _, param := range toolConfig.Parameters {
+		name := strings.TrimSpace(param.Name)
+		if name == "" {
+			continue
+		}
+		validated[name] = struct{}{}
+		value, ok := args[name]
+		if (!ok || value == nil) && param.Default != nil {
+			value = param.Default
+			ok = true
+		}
+		if param.Required && (!ok || toolArgumentValueEmpty(value)) {
+			return fmt.Errorf("required parameter %q is missing or empty", name)
+		}
+		if ok && !toolArgumentValueEmpty(value) && toolArgumentContainsPlaceholder(value) {
+			return fmt.Errorf("parameter %q contains an unresolved placeholder or example target", name)
 		}
 	}
-	e.logger.Debug("工具索引构建完成",
-		zap.Int("totalTools", len(e.config.Tools)),
-		zap.Int("enabledTools", len(e.toolIndex)),
-	)
+	for name, value := range args {
+		if _, ok := validated[name]; ok || toolArgumentValueEmpty(value) {
+			continue
+		}
+		if toolArgumentContainsPlaceholder(value) {
+			return fmt.Errorf("parameter %q contains an unresolved placeholder or example target", name)
+		}
+	}
+	return nil
+}
+
+func toolArgumentValueEmpty(value interface{}) bool {
+	switch v := value.(type) {
+	case nil:
+		return true
+	case string:
+		return strings.TrimSpace(v) == ""
+	case []string:
+		return len(v) == 0
+	case []interface{}:
+		return len(v) == 0
+	default:
+		return false
+	}
+}
+
+func toolArgumentContainsPlaceholder(value interface{}) bool {
+	switch v := value.(type) {
+	case string:
+		return isUnresolvedToolPlaceholder(v)
+	case []string:
+		for _, item := range v {
+			if isUnresolvedToolPlaceholder(item) {
+				return true
+			}
+		}
+	case []interface{}:
+		for _, item := range v {
+			if toolArgumentContainsPlaceholder(item) {
+				return true
+			}
+		}
+	case map[string]interface{}:
+		for _, item := range v {
+			if toolArgumentContainsPlaceholder(item) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isUnresolvedToolPlaceholder(value string) bool {
+	v := strings.ToLower(strings.TrimSpace(value))
+	if v == "" {
+		return false
+	}
+	if (strings.HasPrefix(v, "<") && strings.HasSuffix(v, ">")) ||
+		strings.Contains(v, "{{") || strings.Contains(v, "}}") ||
+		strings.Contains(v, "${") {
+		return true
+	}
+	switch v {
+	case "your_target", "your-target", "your target",
+		"target_ip_address", "target-ip-address", "target_url", "target_domain",
+		"replace_me", "replace-me", "insert_target_here", "todo":
+		return true
+	}
+	if strings.HasPrefix(v, "/path/to/") || strings.HasPrefix(v, "path/to/") ||
+		strings.HasPrefix(v, "/your/path/") || strings.HasPrefix(v, "your/path/") {
+		return true
+	}
+
+	hostInput := v
+	if !strings.Contains(hostInput, "://") {
+		hostInput = "//" + hostInput
+	}
+	if parsed, err := url.Parse(hostInput); err == nil {
+		host := strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
+		switch host {
+		case "target.com", "www.target.com", "target.local",
+			"example.com", "www.example.com", "example.org", "www.example.org",
+			"example.net", "www.example.net":
+			return true
+		}
+	}
+	return false
 }
 
 // ExecuteTool 执行安全工具
@@ -140,6 +287,19 @@ func (e *Executor) ExecuteTool(ctx context.Context, toolName string, args map[st
 			zap.Int("enabledTools", len(e.toolIndex)),
 		)
 		return nil, fmt.Errorf("工具 %s 未找到或未启用", toolName)
+	}
+	if err := validateToolArguments(toolConfig, args); err != nil {
+		e.logger.Warn("拒绝无效的工具参数",
+			zap.String("tool", toolName),
+			zap.Error(err),
+		)
+		return &mcp.ToolResult{
+			Content: []mcp.Content{{
+				Type: "text",
+				Text: fmt.Sprintf("工具参数无效: %v。请提供具体、真实且适用于该工具的输入后重试。", err),
+			}},
+			IsError: true,
+		}, nil
 	}
 
 	e.logger.Debug("找到工具配置",
@@ -289,12 +449,16 @@ func (e *Executor) RegisterTools(mcpServer *mcp.Server) {
 
 	// 重新构建索引（以防配置更新）
 	e.buildToolIndex()
+	registeredCount := 0
 
 	for i, toolConfig := range e.config.Tools {
 		if !toolConfig.Enabled {
 			e.logger.Debug("跳过未启用的工具",
 				zap.String("tool", toolConfig.Name),
 			)
+			continue
+		}
+		if _, available := e.toolIndex[toolConfig.Name]; !available {
 			continue
 		}
 
@@ -338,6 +502,7 @@ func (e *Executor) RegisterTools(mcpServer *mcp.Server) {
 		}
 
 		mcpServer.RegisterTool(tool, handler)
+		registeredCount++
 		e.logger.Debug("注册安全工具成功",
 			zap.String("tool", toolConfigCopy.Name),
 			zap.String("command", toolConfigCopy.Command),
@@ -346,7 +511,8 @@ func (e *Executor) RegisterTools(mcpServer *mcp.Server) {
 	}
 
 	e.logger.Debug("工具注册完成",
-		zap.Int("registeredCount", len(e.config.Tools)),
+		zap.Int("registeredCount", registeredCount),
+		zap.Int("skippedCount", len(e.config.Tools)-registeredCount),
 	)
 }
 
@@ -391,11 +557,25 @@ func (e *Executor) buildCommandArgs(toolName string, toolConfig *config.ToolConf
 			}
 			if param.Position != nil && *param.Position == 0 {
 				value := e.getParamValue(args, param)
-				if value == nil && param.Default != nil {
+				if value == nil {
+					if param.Required {
+						e.logger.Warn("缺少必需的位置参数",
+							zap.String("tool", toolName),
+							zap.String("param", param.Name),
+							zap.Int("position", *param.Position),
+						)
+						return []string{}
+					}
 					value = param.Default
 				}
 				if value != nil {
-					cmdArgs = append(cmdArgs, e.formatParamValue(param, value))
+					formattedValue := e.formatParamValue(param, value)
+					if strings.TrimSpace(formattedValue) == "" && param.Required {
+						return []string{}
+					}
+					if strings.TrimSpace(formattedValue) != "" {
+						cmdArgs = append(cmdArgs, formattedValue)
+					}
 				}
 				break
 			}

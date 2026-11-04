@@ -78,3 +78,6 @@ Thumbs.db
 desktop.ini
 .idea/
 .vscode/
+
+# Local Anthropic API key (never commit)
+.anthropic_key

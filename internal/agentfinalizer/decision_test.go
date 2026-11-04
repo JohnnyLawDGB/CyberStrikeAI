@@ -22,14 +22,19 @@ func newDecisionTestDB(t *testing.T) *database.DB {
 	return db
 }
 
-func saveDecisionTestExecution(t *testing.T, db *database.DB, id, status string) {
+func saveDecisionTestExecution(t *testing.T, db *database.DB, id, status string, conversationIDs ...string) {
 	t.Helper()
+	conversationID := ""
+	if len(conversationIDs) > 0 {
+		conversationID = conversationIDs[0]
+	}
 	if err := db.SaveToolExecution(&mcp.ToolExecution{
-		ID:        id,
-		ToolName:  "test::tool",
-		Arguments: map[string]interface{}{"input": id},
-		Status:    status,
-		StartTime: time.Now(),
+		ID:             id,
+		ToolName:       "test::tool",
+		Arguments:      map[string]interface{}{"input": id},
+		Status:         status,
+		StartTime:      time.Now(),
+		ConversationID: conversationID,
 	}); err != nil {
 		t.Fatalf("SaveToolExecution(%s): %v", id, err)
 	}
@@ -102,8 +107,66 @@ func TestDecideBlocksWhenOnlyFailedEvidenceIsRecorded(t *testing.T) {
 	if d.Finalizable || d.Finalized {
 		t.Fatalf("failed evidence should not satisfy required execution evidence: %+v", d)
 	}
-	if d.Status != StatusBlocked || d.CompletionReason != ReasonMissingEvidence {
-		t.Fatalf("status/reason = %s/%s, want %s/%s", d.Status, d.CompletionReason, StatusBlocked, ReasonMissingEvidence)
+	if d.Status != StatusFailed || d.CompletionReason != ReasonExecutionFailed {
+		t.Fatalf("status/reason = %s/%s, want %s/%s", d.Status, d.CompletionReason, StatusFailed, ReasonExecutionFailed)
+	}
+	if got, want := len(d.FailedExecutionIDs), 2; got != want {
+		t.Fatalf("failed execution ids = %v, want %d", d.FailedExecutionIDs, want)
+	}
+}
+
+func TestDecideRecoversCurrentTurnExecutionIDsFromPersistence(t *testing.T) {
+	db := newDecisionTestDB(t)
+	conv, err := db.CreateConversation("test", database.ConversationCreateMeta{})
+	if err != nil {
+		t.Fatalf("CreateConversation: %v", err)
+	}
+	msg, err := db.AddMessage(conv.ID, "assistant", "处理中...", nil)
+	if err != nil {
+		t.Fatalf("AddMessage: %v", err)
+	}
+	saveDecisionTestExecution(t, db, "run-recovered", mcp.ToolExecutionStatusFailed, conv.ID)
+
+	d := Decide(db, Input{
+		Response:                 "工具执行失败。",
+		ConversationID:           conv.ID,
+		AssistantMessageID:       msg.ID,
+		RequireExecutionEvidence: true,
+	})
+
+	if d.CompletionReason != ReasonExecutionFailed || d.Status != StatusFailed {
+		t.Fatalf("recovered failed execution was not classified correctly: %+v", d)
+	}
+	if len(d.MCPExecutionIDs) != 1 || d.MCPExecutionIDs[0] != "run-recovered" {
+		t.Fatalf("recovered execution ids = %v", d.MCPExecutionIDs)
+	}
+	if len(d.EvidenceRefs) != 1 || len(d.FailedExecutionIDs) != 1 {
+		t.Fatalf("recovered evidence metadata mismatch: %+v", d)
+	}
+}
+
+func TestDecideDoesNotRecoverExecutionFromEarlierTurn(t *testing.T) {
+	db := newDecisionTestDB(t)
+	conv, err := db.CreateConversation("test", database.ConversationCreateMeta{})
+	if err != nil {
+		t.Fatalf("CreateConversation: %v", err)
+	}
+	saveDecisionTestExecution(t, db, "run-earlier", mcp.ToolExecutionStatusCompleted, conv.ID)
+	time.Sleep(2 * time.Millisecond)
+	msg, err := db.AddMessage(conv.ID, "assistant", "处理中...", nil)
+	if err != nil {
+		t.Fatalf("AddMessage: %v", err)
+	}
+
+	d := Decide(db, Input{
+		Response:                 "没有执行新工具。",
+		ConversationID:           conv.ID,
+		AssistantMessageID:       msg.ID,
+		RequireExecutionEvidence: true,
+	})
+
+	if d.CompletionReason != ReasonMissingEvidence || len(d.MCPExecutionIDs) != 0 {
+		t.Fatalf("earlier execution must not satisfy the current turn: %+v", d)
 	}
 }
 

@@ -22,6 +22,12 @@ import (
 
 const batchQueueWorkerIdlePoll = 200 * time.Millisecond
 
+const batchTaskExecutionContract = `[Batch execution requirements]
+- Use only tools actually available in this run and only for purposes supported by their schema.
+- Never invent or pass placeholders, example hosts, sample domains, fake credentials, or guessed file paths.
+- A task that needs a local artifact, hash list, repository, image, binary, AD domain, credentials, or domain controller may run only when that concrete input is present.
+- Do not substitute an unrelated tool merely to produce execution evidence. If prerequisites are missing or the requested technique is inapplicable, state the exact blocker without claiming success.`
+
 // executeBatchQueue 使用并发 worker 池执行批量任务队列。
 func (h *AgentHandler) executeBatchQueue(queueID string) {
 	defer h.batchTaskManager.UnmarkQueueExecutor(queueID)
@@ -148,6 +154,7 @@ func (h *AgentHandler) executeOneBatchSubTask(queueID string, queue *BatchTaskQu
 			}
 		}
 	}
+	finalMessage = strings.TrimSpace(finalMessage) + "\n\n" + batchTaskExecutionContract
 
 	if _, err = h.db.AddMessage(conversationID, "user", task.Message, nil); err != nil {
 		h.logger.Error("保存用户消息失败", zap.String("queueId", queueID), zap.String("taskId", task.ID), zap.String("conversationId", conversationID), zap.Error(err))
@@ -327,7 +334,7 @@ func (h *AgentHandler) executeOneBatchSubTask(queueID string, queue *BatchTaskQu
 	}))
 
 	if assistantMessageID == "" {
-		_, err = h.db.AddMessage(conversationID, "assistant", resText, mcpIDs)
+		_, err = h.db.AddMessage(conversationID, "assistant", resText, decision.MCPExecutionIDs)
 	} else if !decision.Finalizable {
 		err = nil
 	}

@@ -136,7 +136,7 @@ func (h *OpenAPIHandler) GetOpenAPISpec(c *gin.Context) {
 						},
 						"completionReason": map[string]interface{}{
 							"type":        "string",
-							"description": "最终化或阻断原因，例如 verified、pending_tool_executions、missing_execution_evidence",
+							"description": "最终化或阻断原因，例如 verified、pending_tool_executions、execution_failed、missing_execution_evidence",
 						},
 						"evidenceVerified": map[string]interface{}{
 							"type":        "boolean",
@@ -2005,7 +2005,7 @@ func (h *OpenAPIHandler) GetOpenAPISpec(c *gin.Context) {
 				"post": map[string]interface{}{
 					"tags":        []string{"批量任务"},
 					"summary":     "启动批量任务队列",
-					"description": "开始执行批量任务队列中的任务",
+					"description": "开始或继续执行批量任务队列中的任务；已完成或已取消的队列会先重置全部子任务，再开始新一轮执行",
 					"operationId": "startBatchQueue",
 					"parameters": []map[string]interface{}{
 						{

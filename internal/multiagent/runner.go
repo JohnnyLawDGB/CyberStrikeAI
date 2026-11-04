@@ -17,6 +17,7 @@ import (
 	"cyberstrike-ai/internal/database"
 	"cyberstrike-ai/internal/einomcp"
 	"cyberstrike-ai/internal/project"
+	"cyberstrike-ai/internal/projectprompt"
 	"cyberstrike-ai/internal/reasoning"
 	"cyberstrike-ai/internal/security"
 
@@ -252,7 +253,8 @@ func RunDeepAgent(
 				middlewareConfig:     &ma.EinoMiddleware,
 			})
 
-			subInstrFinal := project.AppendVisionImageAnalysisIfReady(instr, appCfg.Vision.Ready())
+			subInstrFinal := project.AppendSystemPromptBlock(instr, projectprompt.UserInteractionContractSection(userMessage))
+			subInstrFinal = project.AppendVisionImageAnalysisIfReady(subInstrFinal, appCfg.Vision.Ready())
 			subInstrFinal = injectToolNamesOnlyInstruction(ctx, subInstrFinal, subTools, subToolSearchActive)
 			if logger != nil {
 				subNames := collectToolNames(ctx, subTools)
@@ -334,6 +336,7 @@ func RunDeepAgent(
 	}
 
 	orchInstruction = project.AppendSystemPromptBlock(orchInstruction, systemPromptExtra)
+	orchInstruction = project.AppendSystemPromptBlock(orchInstruction, projectprompt.UserInteractionContractSection(userMessage))
 	orchInstruction = project.AppendVisionImageAnalysisIfReady(orchInstruction, appCfg.Vision.Ready())
 	orchInstruction = injectToolNamesOnlyInstruction(ctx, orchInstruction, mainTools, mainToolSearchActive)
 	if logger != nil {

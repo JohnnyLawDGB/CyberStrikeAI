@@ -3,7 +3,6 @@ package handler
 import (
 	"fmt"
 	"strings"
-	"time"
 
 	"cyberstrike-ai/internal/agentfinalizer"
 	"cyberstrike-ai/internal/multiagent"
@@ -38,7 +37,7 @@ func (h *AgentHandler) finalizeAgentRunForDeliveryWithPolicy(
 		MCPExecutionIDs:          mcpExecutionIDs,
 		RequireExecutionEvidence: requireExecutionEvidence,
 	})
-	h.persistFinalizationDecision(conversationID, assistantMessageID, agentMode, mcpExecutionIDs, reasoningContent, decision)
+	h.persistFinalizationDecision(conversationID, assistantMessageID, agentMode, decision.MCPExecutionIDs, reasoningContent, decision)
 	return decision
 }
 
@@ -87,13 +86,17 @@ func (h *AgentHandler) persistFinalizationDecision(
 		return
 	}
 	_ = h.db.AddProcessDetail(assistantMessageID, conversationID, "finalization_check", finalizationCheckMessage(decision), decision)
-	if decision.Finalizable {
-		if err := h.db.UpdateAssistantMessageFinalize(assistantMessageID, decision.FinalText, mcpExecutionIDs, reasoningContent); err != nil && h.logger != nil {
-			h.logger.Warn("更新最终助手消息失败", zap.Error(err), zap.String("conversationId", conversationID), zap.String("agentMode", agentMode))
-		}
-		return
+	resolvedExecutionIDs := decision.MCPExecutionIDs
+	if len(resolvedExecutionIDs) == 0 {
+		resolvedExecutionIDs = mcpExecutionIDs
 	}
-	_, _ = h.db.Exec("UPDATE messages SET content = ?, updated_at = ? WHERE id = ?", finalizationBlockedMessage(decision), time.Now(), assistantMessageID)
+	content := decision.FinalText
+	if !decision.Finalizable {
+		content = finalizationBlockedMessage(decision)
+	}
+	if err := h.db.UpdateAssistantMessageFinalize(assistantMessageID, content, resolvedExecutionIDs, reasoningContent); err != nil && h.logger != nil {
+		h.logger.Warn("更新最终助手消息失败", zap.Error(err), zap.String("conversationId", conversationID), zap.String("agentMode", agentMode))
+	}
 }
 
 func (h *AgentHandler) finalizeCandidateForDelivery(
@@ -131,13 +134,17 @@ func (h *AgentHandler) finalizeCandidateForDeliveryWithPolicy(
 		return decision
 	}
 	_ = h.db.AddProcessDetail(assistantMessageID, conversationID, "finalization_check", finalizationCheckMessage(decision), decision)
-	if decision.Finalizable {
-		if err := h.db.UpdateAssistantMessageFinalize(assistantMessageID, decision.FinalText, mcpExecutionIDs, reasoningContent); err != nil && h.logger != nil {
-			h.logger.Warn("更新最终助手消息失败", zap.Error(err), zap.String("conversationId", conversationID), zap.String("agentMode", agentMode))
-		}
-		return decision
+	resolvedExecutionIDs := decision.MCPExecutionIDs
+	if len(resolvedExecutionIDs) == 0 {
+		resolvedExecutionIDs = mcpExecutionIDs
 	}
-	_, _ = h.db.Exec("UPDATE messages SET content = ?, updated_at = ? WHERE id = ?", finalizationBlockedMessage(decision), time.Now(), assistantMessageID)
+	content := decision.FinalText
+	if !decision.Finalizable {
+		content = finalizationBlockedMessage(decision)
+	}
+	if err := h.db.UpdateAssistantMessageFinalize(assistantMessageID, content, resolvedExecutionIDs, reasoningContent); err != nil && h.logger != nil {
+		h.logger.Warn("更新最终助手消息失败", zap.Error(err), zap.String("conversationId", conversationID), zap.String("agentMode", agentMode))
+	}
 	return decision
 }
 
@@ -159,6 +166,9 @@ func finalizationBlockedMessage(d agentfinalizer.Decision) string {
 	if len(d.PendingExecutionIDs) > 0 {
 		parts = append(parts, fmt.Sprintf("仍有 %d 个工具执行未结束: %s", len(d.PendingExecutionIDs), strings.Join(d.PendingExecutionIDs, ", ")))
 	}
+	if len(d.FailedExecutionIDs) > 0 {
+		parts = append(parts, fmt.Sprintf("失败的工具执行 (%d): %s", len(d.FailedExecutionIDs), strings.Join(d.FailedExecutionIDs, ", ")))
+	}
 	if len(d.MissingChecks) > 0 {
 		parts = append(parts, "缺失检查: "+strings.Join(d.MissingChecks, "; "))
 	}
@@ -166,7 +176,10 @@ func finalizationBlockedMessage(d agentfinalizer.Decision) string {
 }
 
 func finalizationResponsePayload(d agentfinalizer.Decision, extra map[string]interface{}) map[string]interface{} {
-	return agentfinalizer.ResponsePayload(d, extra)
+	payload := agentfinalizer.ResponsePayload(d, extra)
+	payload["mcpExecutionIds"] = d.MCPExecutionIDs
+	payload["failedExecutionIds"] = d.FailedExecutionIDs
+	return payload
 }
 
 func requestRequiresExecutionEvidence(req *ChatRequest) bool {

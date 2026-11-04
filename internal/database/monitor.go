@@ -595,6 +595,49 @@ func (db *DB) GetToolExecution(id string) (*mcp.ToolExecution, error) {
 	return &exec, nil
 }
 
+// ListToolExecutionIDsForMessageTurn returns every tool execution that started
+// in the same conversation after the assistant placeholder for the current
+// turn was created. This is a persistence-backed fallback for agent runtimes
+// that emitted a tool result but failed to propagate its execution ID through
+// an in-memory callback.
+func (db *DB) ListToolExecutionIDsForMessageTurn(conversationID, messageID string) ([]string, error) {
+	conversationID = strings.TrimSpace(conversationID)
+	messageID = strings.TrimSpace(messageID)
+	if conversationID == "" || messageID == "" {
+		return nil, nil
+	}
+
+	rows, err := db.Query(`
+		SELECT e.id
+		FROM tool_executions e
+		JOIN messages m
+		  ON m.id = ?
+		 AND m.conversation_id = ?
+		WHERE e.conversation_id = ?
+		  AND julianday(e.start_time) >= julianday(m.created_at)
+		ORDER BY julianday(e.start_time) ASC, e.rowid ASC
+	`, messageID, conversationID, conversationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	ids := make([]string, 0)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		if id = strings.TrimSpace(id); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
 // UserCanAccessToolExecution enforces ownership for monitor detail and mutation
 // endpoints. Legacy records without an owner or conversation fail closed for
 // non-global users.

@@ -239,6 +239,7 @@ function finalizationReasonLabel(reason, status) {
     const labels = {
         pending_tool_executions: '等待工具执行完成',
         missing_execution_evidence: '缺少完成态证据',
+        execution_failed: '工具执行失败',
         awaiting_hitl: '等待人工确认',
         empty_response: '未捕获到有效回复',
         missing_finalization_contract: '缺少最终化证明',
