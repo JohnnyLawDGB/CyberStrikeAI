@@ -172,7 +172,15 @@ function syncSettingsCustomSelect(select) {
 }
 
 function refreshSettingsCustomSelects() {
-    settingsCustomSelects.forEach((_reg, select) => syncSettingsCustomSelect(select));
+    settingsCustomSelects.forEach((reg, select) => {
+        if (!select.isConnected) {
+            closeSettingsCustomSelect(select);
+            reg.menu.remove();
+            settingsCustomSelects.delete(select);
+            return;
+        }
+        syncSettingsCustomSelect(select);
+    });
 }
 
 function enhanceSettingsSelect(select) {
@@ -277,10 +285,7 @@ function enhanceSettingsSelect(select) {
     syncSettingsCustomSelect(select);
 }
 
-function initSettingsCustomSelects(root) {
-    const scope = root || document.getElementById('page-settings');
-    if (!scope) return;
-    scope.querySelectorAll('select').forEach(enhanceSettingsSelect);
+function bindSettingsCustomSelectEvents() {
     if (!settingsCustomSelectsDocBound) {
         document.addEventListener('click', closeAllSettingsCustomSelects);
         document.addEventListener('keydown', (event) => {
@@ -288,8 +293,35 @@ function initSettingsCustomSelects(root) {
         });
         document.addEventListener('scroll', repositionOpenSettingsCustomSelects, true);
         window.addEventListener('resize', repositionOpenSettingsCustomSelects);
+        window.addEventListener('hashchange', closeAllSettingsCustomSelects);
         settingsCustomSelectsDocBound = true;
     }
+}
+
+function initSettingsCustomSelects(root) {
+    const scope = root || document.getElementById('page-settings');
+    if (!scope) return;
+    scope.querySelectorAll('select').forEach(enhanceSettingsSelect);
+    bindSettingsCustomSelectEvents();
+    refreshSettingsCustomSelects();
+}
+
+// Pagination menus use the floating select so clipped panels cannot hide options.
+function initPaginationSelects(root) {
+    if (!root) return;
+    root.querySelectorAll('.pagination-page-size select').forEach(select => {
+        if (select.dataset.projectsCustomSelect === '1') return;
+        enhanceSettingsSelect(select);
+        const reg = settingsCustomSelects.get(select);
+        if (!reg) return;
+        reg.wrapper.classList.add('pagination-custom-select');
+        const label = select.labels?.[0] || select.closest('.pagination-page-size');
+        const labelText = label && Array.from(label.childNodes)
+            .filter(node => node.nodeType === 3).map(node => node.textContent).join(' ').trim();
+        const accessibleName = select.getAttribute('aria-label') || labelText;
+        if (accessibleName) reg.trigger.setAttribute('aria-label', accessibleName);
+    });
+    bindSettingsCustomSelectEvents();
     refreshSettingsCustomSelects();
 }
 
@@ -661,6 +693,13 @@ function switchSettingsSection(section) {
         return;
     }
 
+    // Unknown hash sections must not hide every settings panel.
+    const requestedContent = document.getElementById(`settings-section-${section}`);
+    if (!requestedContent) return;
+    if (window.location.hash.split('?')[0] === '#settings') {
+        history.replaceState(null, '', section === 'token-usage' ? '#settings?section=token-usage' : '#settings');
+    }
+
     // 更新导航项状态
     document.querySelectorAll('.settings-nav-item').forEach(item => {
         item.classList.remove('active');
@@ -679,6 +718,11 @@ function switchSettingsSection(section) {
         activeContent.classList.add('active');
         initSettingsCustomSelects(activeContent);
     }
+    if (section === 'token-usage' && typeof refreshTokenUsage === 'function') {
+        refreshTokenUsage();
+    } else if (typeof stopTokenUsageRequests === 'function') {
+        stopTokenUsageRequests();
+    }
 	if (section === 'robots' && typeof window.loadVulnerabilityAlertSubscription === 'function') {
 		window.loadVulnerabilityAlertSubscription();
 	}
@@ -690,6 +734,14 @@ function switchSettingsSection(section) {
     }
     if (section === 'storage' && typeof initStorageSection === 'function') {
         setTimeout(initStorageSection, 0);
+    }
+    if (section === 'update') {
+        if (typeof loadUpdateConsole === 'function') {
+            loadUpdateConsole();
+        }
+    } else if (typeof stopUpdatePolling === 'function') {
+        // 离开更新分区就停掉进度轮询；服务端的任务照跑，回来时 loadUpdateConsole 会接着读。
+        stopUpdatePolling();
     }
 }
 
@@ -1655,6 +1707,7 @@ function renderToolsPagination() {
     
     // 如果只有一页或没有数据，不显示分页
     if (toolsPagination.totalPages <= 1) {
+        initPaginationSelects(toolsList);
         return;
     }
     
@@ -1696,6 +1749,7 @@ function renderToolsPagination() {
     `;
     
     toolsList.appendChild(pagination);
+    initPaginationSelects(pagination);
 }
 
 // 处理工具checkbox状态变化
@@ -2612,6 +2666,31 @@ function ensureAIConfigShape(cfg) {
     return normalizeAIConfigProviderProfiles({ default_channel: def, channels });
 }
 
+// parseCustomHeadersInput 把「每行一条 KEY=VALUE」的文本解析为请求头对象。
+// 空行与 # 开头的行会被忽略；键或值为空的行直接跳过。
+function parseCustomHeadersInput() {
+    const el = document.getElementById('openai-custom-headers');
+    if (!el) return {};
+    const out = {};
+    String(el.value || '').split(/\r?\n/).forEach((line) => {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.charAt(0) === '#') return;
+        const idx = trimmed.indexOf('=');
+        if (idx <= 0) return;
+        const key = trimmed.slice(0, idx).trim();
+        const value = trimmed.slice(idx + 1).trim();
+        if (!key || !value) return;
+        out[key] = value;
+    });
+    return out;
+}
+
+// formatCustomHeaders 把请求头对象写回「每行一条 KEY=VALUE」的文本。
+function formatCustomHeaders(headers) {
+    if (!headers || typeof headers !== 'object') return '';
+    return Object.keys(headers).sort().map((k) => k + '=' + headers[k]).join('\n');
+}
+
 function readAIChannelFromMainForm(id) {
     const prev = currentConfig?.ai?.channels?.[id] || {};
     const maxCompletionTokens = parseInt(document.getElementById('openai-max-completion-tokens')?.value, 10) || 32768;
@@ -2624,6 +2703,7 @@ function readAIChannelFromMainForm(id) {
         model: document.getElementById('openai-model')?.value.trim() || '',
         max_total_tokens: parseInt(document.getElementById('openai-max-total-tokens')?.value, 10) || 120000,
         max_completion_tokens: maxCompletionTokens,
+        headers: parseCustomHeadersInput(),
         reasoning: {
             ...(prev.reasoning || {}),
             mode: document.getElementById('openai-reasoning-mode')?.value || 'auto',
@@ -2656,6 +2736,8 @@ function writeAIChannelToMainForm(id) {
     if (maxTokensEl) maxTokensEl.value = ch.max_total_tokens || 120000;
     const maxCompletionTokensEl = document.getElementById('openai-max-completion-tokens');
     if (maxCompletionTokensEl) maxCompletionTokensEl.value = ch.max_completion_tokens || 32768;
+    const customHeadersEl = document.getElementById('openai-custom-headers');
+    if (customHeadersEl) customHeadersEl.value = formatCustomHeaders(ch.headers);
     const r = ch.reasoning || {};
     const modeEl = document.getElementById('openai-reasoning-mode');
     if (modeEl) {
@@ -2760,7 +2842,8 @@ function bindAIChannelEditorPreviewSync() {
         'openai-provider',
         'openai-api-key',
         'openai-base-url',
-        'openai-model'
+        'openai-model',
+        'openai-custom-headers'
     ];
     ids.forEach((fieldId) => {
         const el = document.getElementById(fieldId);
@@ -3199,9 +3282,11 @@ async function probeSelectedAIChannels() {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     provider: ch.provider || 'openai_compatible',
+                    channel_id: id,
                     base_url: ch.base_url || '',
                     api_key: ch.api_key || '',
-                    model: ch.model || ''
+                    model: ch.model || '',
+                    headers: ch.headers || {}
                 })
             });
             const result = await response.json().catch(() => ({}));
@@ -3527,6 +3612,12 @@ function populateModelSelect(scope, models, currentValue) {
 async function fetchModelList(scope) {
     const tFn = typeof window.t === 'function' ? window.t : (k) => k;
     const creds = resolveModelListCredentials(scope);
+    creds.credential_scope = scope;
+    if (scope === 'openai') creds.channel_id = selectedAIChannelId;
+    const keyInputByScope = {vision: 'vision-api-key', hitlAudit: 'hitl-audit-model-api-key', knowledgeEmbedding: 'knowledge-embedding-api-key'};
+    if (keyInputByScope[scope] && !document.getElementById(keyInputByScope[scope])?.value.trim()) {
+        creds.channel_id = selectedAIChannelId;
+    }
     const modelListUiIds = {
         openai: {
             btnId: 'fetch-openai-models-btn',
@@ -3641,7 +3732,7 @@ async function testVisionConnection() {
         const response = await apiFetch('/api/config/test-vision', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ vision: vision, openai: openai })
+            body: JSON.stringify({ vision: vision, openai: openai, channel_id: selectedAIChannelId })
         });
         const result = await response.json();
         if (result.success) {
@@ -3708,11 +3799,19 @@ function collectHitlAuditModelEffectiveConfig() {
         base_url: document.getElementById('openai-base-url')?.value.trim() || '',
         model: document.getElementById('openai-model')?.value.trim() || ''
     };
+    const auditProvider = document.getElementById('hitl-audit-model-provider')?.value || '';
+    const auditKey = document.getElementById('hitl-audit-model-api-key')?.value.trim() || '';
+    const overriddenBaseUrl = document.getElementById('hitl-audit-model-base-url')?.value.trim() || '';
+    const mainChannelId = normalizeAIChannelId(selectedAIChannelId || currentConfig?.ai?.default_channel || 'default');
+    const mainHeaders = currentConfig?.ai?.channels?.[mainChannelId]?.headers || {};
+    const auditHeaders = currentConfig?.hitl?.audit_model?.headers || {};
     return {
         provider: document.getElementById('hitl-audit-model-provider')?.value || main.provider,
-        base_url: document.getElementById('hitl-audit-model-base-url')?.value.trim() || main.base_url,
+        base_url: overriddenBaseUrl || main.base_url,
         api_key: document.getElementById('hitl-audit-model-api-key')?.value.trim() || main.api_key,
-        model: document.getElementById('hitl-audit-model-name')?.value.trim() || main.model
+        model: document.getElementById('hitl-audit-model-name')?.value.trim() || main.model,
+        // 审计模型留空即复用主渠道，自定义请求头必须一起跟随，否则私有鉴权头的供应商测试必然失败。
+        headers: Object.keys(auditHeaders).length ? auditHeaders : ((overriddenBaseUrl || auditProvider || auditKey) ? {} : mainHeaders)
     };
 }
 
@@ -3763,6 +3862,8 @@ async function testHitlAuditModelConnection() {
         const payload = typeSafe
             ? { base_url: baseUrl, api_key: apiKey, model: model }
             : cfg;
+        payload.credential_scope = 'hitlAudit';
+        if (!document.getElementById('hitl-audit-model-api-key')?.value.trim()) payload.channel_id = selectedAIChannelId;
         const response = await apiFetch(endpoint, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -3886,9 +3987,11 @@ async function testOpenAIConnection() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 provider: provider,
+                channel_id: channelId,
                 base_url: baseUrl,
                 api_key: apiKey,
-                model: model
+                model: model,
+                headers: currentConfig?.ai?.channels?.[channelId]?.headers || {}
             })
         });
 
@@ -4052,6 +4155,28 @@ async function saveToolsConfig() {
     }
 }
 
+function setPasswordFieldError(input, message) {
+    if (!input) return;
+    input.classList.toggle('error', !!message);
+    input.setAttribute('aria-invalid', message ? 'true' : 'false');
+    const error = document.getElementById(input.id + '-error');
+    if (error) {
+        error.textContent = message || '';
+        error.hidden = !message;
+        input.setAttribute('aria-describedby', error.id);
+    }
+}
+
+function passwordValidationText(key, fallback) {
+    return typeof window.t === 'function' ? window.t('settingsSecurity.' + key) : fallback;
+}
+
+function clearPasswordFieldError(input) {
+    setPasswordFieldError(input, '');
+    const error = document.getElementById('password-form-error');
+    if (error) { error.textContent = ''; error.hidden = true; }
+}
+
 function resetPasswordForm() {
     const currentInput = document.getElementById('auth-current-password');
     const newInput = document.getElementById('auth-new-password');
@@ -4060,9 +4185,11 @@ function resetPasswordForm() {
     [currentInput, newInput, confirmInput].forEach(input => {
         if (input) {
             input.value = '';
-            input.classList.remove('error');
+            setPasswordFieldError(input, '');
         }
     });
+    const error = document.getElementById('password-form-error');
+    if (error) { error.textContent = ''; error.hidden = true; }
 }
 
 async function changePassword() {
@@ -4071,7 +4198,9 @@ async function changePassword() {
     const confirmInput = document.getElementById('auth-confirm-password');
     const submitBtn = document.querySelector('.change-password-submit');
 
-    [currentInput, newInput, confirmInput].forEach(input => input && input.classList.remove('error'));
+    [currentInput, newInput, confirmInput].forEach(input => setPasswordFieldError(input, ''));
+    const formError = document.getElementById('password-form-error');
+    if (formError) { formError.textContent = ''; formError.hidden = true; }
 
     const currentPassword = currentInput?.value.trim() || '';
     const newPassword = newInput?.value.trim() || '';
@@ -4080,22 +4209,22 @@ async function changePassword() {
     let hasError = false;
 
     if (!currentPassword) {
-        currentInput?.classList.add('error');
+        setPasswordFieldError(currentInput, passwordValidationText('currentRequired', '请输入当前密码'));
         hasError = true;
     }
 
     if (!newPassword || newPassword.length < 8) {
-        newInput?.classList.add('error');
+        setPasswordFieldError(newInput, passwordValidationText('newTooShort', '新密码至少需要 8 位'));
         hasError = true;
     }
 
     if (newPassword !== confirmPassword) {
-        confirmInput?.classList.add('error');
+        setPasswordFieldError(confirmInput, passwordValidationText('confirmMismatch', '两次输入的新密码不一致'));
         hasError = true;
     }
 
     if (hasError) {
-        alert(typeof window.t === 'function' ? window.t('settings.security.fillPasswordHint') : '请正确填写当前密码和新密码，新密码至少 8 位且需要两次输入一致。');
+        [currentInput, newInput, confirmInput].find(input => input && input.getAttribute('aria-invalid') === 'true')?.focus();
         return;
     }
 
@@ -4127,6 +4256,7 @@ async function changePassword() {
         closeSettings();
     } catch (error) {
         console.error('修改密码失败:', error);
+        if (formError) { formError.textContent = error.message; formError.hidden = false; }
         alert((typeof window.t === 'function' ? window.t('settings.security.changePasswordFailed') : '修改密码失败') + ': ' + error.message);
     } finally {
         if (submitBtn) {

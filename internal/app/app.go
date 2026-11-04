@@ -446,6 +446,7 @@ func New(cfg *config.Config, log *logger.Logger, configPath string) (*App, error
 	authHandler.SetAudit(auditSvc)
 	attackChainHandler := handler.NewAttackChainHandler(db, &cfg.OpenAI, log.Logger)
 	vulnerabilityHandler := handler.NewVulnerabilityHandler(db, log.Logger)
+	vulnerabilityHandler.SetTaskStateProvider(agentHandler)
 	assetHandler := handler.NewAssetHandler(db, log.Logger)
 	projectHandler := handler.NewProjectHandler(db, log.Logger)
 	rbacHandler := handler.NewRBACHandler(db, log.Logger)
@@ -471,6 +472,7 @@ func New(cfg *config.Config, log *logger.Logger, configPath string) (*App, error
 	externalMCPHandler := handler.NewExternalMCPHandler(externalMCPMgr, cfg, configPath, log.Logger)
 	externalMCPHandler.SetAudit(auditSvc)
 	roleHandler := handler.NewRoleHandler(cfg, configPath, log.Logger)
+	roleHandler.SetDB(db)
 	roleHandler.SetAudit(auditSvc)
 	skillsHandler := handler.NewSkillsHandler(cfg, configPath, log.Logger)
 	skillsHandler.SetAudit(auditSvc)
@@ -609,6 +611,15 @@ func New(cfg *config.Config, log *logger.Logger, configPath string) (*App, error
 		return nil
 	})
 
+	// The one-click update acts on this installation's own tree, rooted where the live config
+	// file is. Its restart hook exits after a graceful shutdown, which is only "a restart" when
+	// something supervises the process - so the endpoint reports whether it is standing down or
+	// whether somebody has to start it again, instead of promising a boot that may not happen.
+	updateHandler := handler.NewUpdateHandler(configDir, log.Logger, auditSvc, func() {
+		app.Shutdown()
+		os.Exit(0)
+	}, configHandler.UpdateSource, configHandler.SetUpdateSource)
+
 	// 设置路由（使用 App 实例以便动态获取 handler）
 	setupRoutes(
 		router,
@@ -641,6 +652,7 @@ func New(cfg *config.Config, log *logger.Logger, configPath string) (*App, error
 		mcpServer,
 		authManager,
 		openAPIHandler,
+		updateHandler,
 	)
 
 	return app, nil
@@ -946,6 +958,7 @@ func setupRoutes(
 	mcpServer *mcp.Server,
 	authManager *security.AuthManager,
 	openAPIHandler *handler.OpenAPIHandler,
+	updateHandler *handler.UpdateHandler,
 ) {
 	// API路由
 	api := router.Group("/api")
@@ -1013,6 +1026,10 @@ func setupRoutes(
 
 		// Eino ADK 单代理（ChatModelAgent + Runner；不依赖 multi_agent.enabled）
 		protected.POST("/eino-agent", agentHandler.EinoSingleAgentLoop)
+		protected.POST("/eino-agent/runs", agentHandler.SubmitSingleAgentRun)
+		protected.POST("/multi-agent/runs", agentHandler.SubmitMultiAgentRun)
+		protected.GET("/eino-agent/runs/:runId", agentHandler.GetAgentRun)
+		protected.GET("/multi-agent/runs/:runId", agentHandler.GetAgentRun)
 		protected.POST("/eino-agent/stream", agentHandler.EinoSingleAgentLoopStream)
 		protected.GET("/hitl/pending", agentHandler.ListHITLPending)
 		protected.GET("/hitl/logs", agentHandler.ListHITLLogs)
@@ -1121,6 +1138,16 @@ func setupRoutes(
 		protected.POST("/config/test-typesafe", configHandler.TestTypeSafe)
 		protected.POST("/config/test-vision", configHandler.TestVision)
 		protected.POST("/config/list-models", configHandler.ListModels)
+
+		// 系统更新（保持本安装自身源码最新：查看、检查、应用、进度、回滚、接入、更新源）
+		protected.GET("/system/update", updateHandler.GetStatus)
+		protected.GET("/system/update/job", updateHandler.Job)
+		protected.POST("/system/update/check", updateHandler.Check)
+		protected.POST("/system/update/apply", updateHandler.Apply)
+		protected.POST("/system/update/restart", updateHandler.Restart)
+		protected.POST("/system/update/rollback", updateHandler.Rollback)
+		protected.POST("/system/update/adopt", updateHandler.Adopt)
+		protected.POST("/system/update/source", updateHandler.SaveSource)
 
 		// 系统设置 - 终端（执行命令，提高运维效率）
 		protected.POST("/terminal/run", terminalHandler.RunCommand)
@@ -1306,7 +1333,9 @@ func setupRoutes(
 		protected.GET("/vulnerability-alerts/subscription", vulnerabilityHandler.GetMyAlertSubscription)
 		protected.PUT("/vulnerability-alerts/subscription", vulnerabilityHandler.UpdateMyAlertSubscription)
 		protected.GET("/vulnerabilities/:id", vulnerabilityHandler.GetVulnerability)
+		protected.GET("/vulnerabilities/:id/download", vulnerabilityHandler.DownloadVulnerability)
 		protected.POST("/vulnerabilities", vulnerabilityHandler.CreateVulnerability)
+		protected.POST("/vulnerabilities/:id/retest", vulnerabilityHandler.CreateRetest)
 		protected.PUT("/vulnerabilities/:id", vulnerabilityHandler.UpdateVulnerability)
 		protected.DELETE("/vulnerabilities/:id", vulnerabilityHandler.DeleteVulnerability)
 

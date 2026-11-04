@@ -302,10 +302,10 @@ func (h *AgentHandler) executeOneBatchSubTask(queueID string, queue *BatchTaskQu
 	if useBatchMulti {
 		agentMode = "batch_eino_" + batchOrch
 	}
-	decision := h.decideAgentRunForDeliveryWithPolicy(conversationID, assistantMessageID, agentMode, resultMA, mcpIDs, true)
+	decision := h.decideAgentRunForDeliveryWithPolicy(conversationID, assistantMessageID, agentMode, resultMA, mcpIDs, false)
 	autoCancelledPendingExecutionIDs := h.cleanupPendingToolExecutionsAfterIteration(taskCtx, conversationID, decision, progressCallback)
 	if len(autoCancelledPendingExecutionIDs) > 0 {
-		decision = h.decideAgentRunForDeliveryWithPolicy(conversationID, assistantMessageID, agentMode, resultMA, mcpIDs, true)
+		decision = h.decideAgentRunForDeliveryWithPolicy(conversationID, assistantMessageID, agentMode, resultMA, mcpIDs, false)
 	}
 	h.persistFinalizationDecision(conversationID, assistantMessageID, agentMode, mcpIDs, reasoningContent, decision)
 	resText := decision.FinalText
@@ -385,7 +385,7 @@ func (h *AgentHandler) handleBatchSubTaskRunError(
 		strings.Contains(strings.ToLower(errStr), "context canceled") ||
 		strings.Contains(strings.ToLower(errStr), "context cancelled") ||
 		(partialResp != "" && (strings.Contains(partialResp, "任务已被取消") || strings.Contains(partialResp, "任务执行中断")))
-	isTimeout := errors.Is(runErr, context.DeadlineExceeded) || errors.Is(context.Cause(taskCtx), context.DeadlineExceeded)
+	isTimeout := taskDeadlineExceeded(taskCtx)
 
 	if isTimeout {
 		*finishStatus = "timeout"
