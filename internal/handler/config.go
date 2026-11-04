@@ -98,6 +98,7 @@ type ConfigHandler struct {
 	logger                     *zap.Logger
 	mu                         sync.RWMutex
 	toolGuard                  *toolguard.Manager
+	toolGuardRevision          string                  // protected by mu; advanced only after a successful save
 	lastEmbeddingConfig        *config.EmbeddingConfig // 上一次的嵌入模型配置（用于检测变更）
 }
 
@@ -372,7 +373,7 @@ func (h *ConfigHandler) GetConfig(c *gin.Context) {
 		),
 	}
 
-	c.JSON(http.StatusOK, GetConfigResponse{
+	response, err := maskedConfigResponse(GetConfigResponse{
 		AI:         h.config.AI,
 		OpenAI:     h.config.OpenAI,
 		Vision:     h.config.Vision,
@@ -389,6 +390,11 @@ func (h *ConfigHandler) GetConfig(c *gin.Context) {
 		Robots:     h.config.Robots,
 		MultiAgent: multiPub,
 	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "配置序列化失败"})
+		return
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 // GetToolsResponse 获取工具列表响应（分页）
@@ -796,6 +802,10 @@ func (h *ConfigHandler) UpdateConfig(c *gin.Context) {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if err := restoreConfigRequestSecrets(&req, h.config); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 
 	// 更新OpenAI配置
 	if req.AI != nil {
@@ -1252,10 +1262,13 @@ func (h *ConfigHandler) UpdateConfig(c *gin.Context) {
 
 // TestOpenAIRequest 测试OpenAI连接请求
 type TestOpenAIRequest struct {
-	Provider string `json:"provider"`
-	BaseURL  string `json:"base_url"`
-	APIKey   string `json:"api_key"`
-	Model    string `json:"model"`
+	CredentialScope string            `json:"credential_scope,omitempty"`
+	ChannelID       string            `json:"channel_id,omitempty"`
+	Provider        string            `json:"provider"`
+	BaseURL         string            `json:"base_url"`
+	APIKey          string            `json:"api_key"`
+	Model           string            `json:"model"`
+	Headers         map[string]string `json:"headers,omitempty"`
 }
 
 // TestOpenAI 测试OpenAI API连接是否可用
@@ -1266,6 +1279,17 @@ func (h *ConfigHandler) TestOpenAI(c *gin.Context) {
 		return
 	}
 
+	resolvedKey, resolveErr := h.resolveProbeSecret(req.APIKey, req.ChannelID, req.BaseURL, req.CredentialScope)
+	if resolveErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": resolveErr.Error()})
+		return
+	}
+	req.APIKey = resolvedKey
+	resolvedHeaders, headerErr := h.resolveProbeHeaders(req)
+	if headerErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": headerErr.Error()})
+		return
+	}
 	if strings.TrimSpace(req.APIKey) == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "API Key 不能为空"})
 		return
@@ -1299,11 +1323,15 @@ func (h *ConfigHandler) TestOpenAI(c *gin.Context) {
 		BaseURL:  baseURL,
 		APIKey:   strings.TrimSpace(req.APIKey),
 		Model:    req.Model,
+		Headers:  resolvedHeaders,
 	}
 	client := openai.NewClient(tmpCfg, nil, h.logger)
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
 	defer cancel()
+	// 连接测试没有真实对话上下文，用一个明确的探测值填充 %session_id%，
+	// 这样带会话占位符的渠道也能在测试时把自定义头真实发出去。
+	ctx = openai.WithSessionID(ctx, "connect-test")
 
 	start := time.Now()
 	if llm.IsClaudeProvider(req.Provider) {
@@ -1383,9 +1411,11 @@ func (h *ConfigHandler) TestOpenAI(c *gin.Context) {
 
 // TestTypeSafeRequest 测试 TypeSafe / Jev 连接。
 type TestTypeSafeRequest struct {
-	BaseURL string `json:"base_url"`
-	APIKey  string `json:"api_key"`
-	Model   string `json:"model"`
+	CredentialScope string `json:"credential_scope,omitempty"`
+	ChannelID       string `json:"channel_id,omitempty"`
+	BaseURL         string `json:"base_url"`
+	APIKey          string `json:"api_key"`
+	Model           string `json:"model"`
 }
 
 // TestTypeSafe 用一条最小 Noul 验证 TypeSafe System One 是否可用。
@@ -1395,6 +1425,12 @@ func (h *ConfigHandler) TestTypeSafe(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的请求参数: " + err.Error()})
 		return
 	}
+	resolvedKey, resolveErr := h.resolveProbeSecret(req.APIKey, req.ChannelID, req.BaseURL, req.CredentialScope)
+	if resolveErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": resolveErr.Error()})
+		return
+	}
+	req.APIKey = resolvedKey
 	if strings.TrimSpace(req.APIKey) == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "TypeSafe API Key 不能为空"})
 		return
@@ -1438,9 +1474,11 @@ func (h *ConfigHandler) TestTypeSafe(c *gin.Context) {
 
 // ListModelsRequest 获取模型列表请求（OpenAI 兼容 GET /models）。
 type ListModelsRequest struct {
-	Provider string `json:"provider"`
-	BaseURL  string `json:"base_url"`
-	APIKey   string `json:"api_key"`
+	CredentialScope string `json:"credential_scope,omitempty"`
+	ChannelID       string `json:"channel_id,omitempty"`
+	Provider        string `json:"provider"`
+	BaseURL         string `json:"base_url"`
+	APIKey          string `json:"api_key"`
 }
 
 // ListModels 代理调用上游 GET /models，返回可用模型 id 列表。
@@ -1451,6 +1489,12 @@ func (h *ConfigHandler) ListModels(c *gin.Context) {
 		return
 	}
 
+	resolvedKey, resolveErr := h.resolveProbeSecret(req.APIKey, req.ChannelID, req.BaseURL, req.CredentialScope)
+	if resolveErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": resolveErr.Error()})
+		return
+	}
+	req.APIKey = resolvedKey
 	provider := strings.TrimSpace(req.Provider)
 	if provider == "" {
 		provider = "openai"
@@ -1512,8 +1556,9 @@ func (h *ConfigHandler) ListModels(c *gin.Context) {
 
 // TestVisionRequest 测试 Vision 模型连接；vision.api_key/base_url 留空时可传 openai 段作回退。
 type TestVisionRequest struct {
-	Vision config.VisionConfig `json:"vision"`
-	OpenAI config.OpenAIConfig `json:"openai,omitempty"`
+	ChannelID string              `json:"channel_id,omitempty"`
+	Vision    config.VisionConfig `json:"vision"`
+	OpenAI    config.OpenAIConfig `json:"openai,omitempty"`
 }
 
 // TestVision 测试视觉模型 API 连接（最小 chat completion）。
@@ -1521,6 +1566,19 @@ func (h *ConfigHandler) TestVision(c *gin.Context) {
 	var req TestVisionRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的请求参数: " + err.Error()})
+		return
+	}
+	mainKey, mainErr := h.resolveProbeSecret(req.OpenAI.APIKey, req.ChannelID, req.OpenAI.BaseURL, "openai")
+	if mainErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": mainErr.Error()})
+		return
+	}
+	req.OpenAI.APIKey = mainKey
+	h.mu.RLock()
+	restoreErr := restoreConfigRequestSecrets(&req, h.config)
+	h.mu.RUnlock()
+	if restoreErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": restoreErr.Error()})
 		return
 	}
 	oa := req.Vision.OpenAICfgEffective(req.OpenAI)
@@ -1865,6 +1923,27 @@ func (h *ConfigHandler) ApplyConfig(c *gin.Context) {
 	})
 }
 
+// SetUpdateSource 记录一键更新的更新源（单个仓库地址；空 = 回到官方仓库）。
+// 走与其他设置相同的写入路径：备份旧文件、按 YAML 文档只改 update 段、原子落盘。
+func (h *ConfigHandler) SetUpdateSource(repo string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	previous := h.config.Update
+	h.config.Update = config.UpdateConfig{Repo: strings.TrimSpace(repo)}
+	if err := h.saveConfig(); err != nil {
+		h.config.Update = previous
+		return err
+	}
+	return nil
+}
+
+// UpdateSource 读当前配置的更新源地址（加读锁；更新处理器每次请求现读，保存后立即生效）。
+func (h *ConfigHandler) UpdateSource() string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.config.Update.Repo
+}
+
 // saveConfig 保存配置到文件
 func (h *ConfigHandler) saveConfig() error {
 	configFileMu.Lock()
@@ -1891,6 +1970,7 @@ func (h *ConfigHandler) saveConfig() error {
 	updateAIConfig(root, h.config.AI)
 	removeKeyFromMap(root.Content[0], "openai")
 	updateVisionConfig(root, h.config.Vision)
+	updateUpdateSourceConfig(root, h.config.Update)
 	updateFOFAConfig(root, h.config.FOFA)
 	updateSpaceSearchConfig(root, "zoomeye", h.config.ZoomEye)
 	updateSpaceSearchConfig(root, "quake", h.config.Quake)
@@ -2018,6 +2098,20 @@ func updateMCPConfig(doc *yaml.Node, cfg config.MCPConfig) {
 	setIntInMap(mcpNode, "port", cfg.Port)
 }
 
+// updateUpdateSourceConfig 写入一键更新的更新源（update 段的单个 repo 字段）。
+// 留空时把整段删掉，而不是留下一个空的 update: 块——"没有配置"应当就是文件里没有这一段，
+// 运行时按官方仓库处理。
+func updateUpdateSourceConfig(doc *yaml.Node, cfg config.UpdateConfig) {
+	root := doc.Content[0]
+	repo := strings.TrimSpace(cfg.Repo)
+	if repo == "" {
+		removeKeyFromMap(root, "update")
+		return
+	}
+	node := ensureMap(root, "update")
+	setStringInMap(node, "repo", repo)
+}
+
 func updateVisionConfig(doc *yaml.Node, cfg config.VisionConfig) {
 	root := doc.Content[0]
 	visionNode := ensureMap(root, "vision")
@@ -2066,6 +2160,7 @@ func updateOpenAIConfig(doc *yaml.Node, cfg config.OpenAIConfig) {
 	setStringInMap(openaiNode, "api_key", cfg.APIKey)
 	setStringInMap(openaiNode, "base_url", cfg.BaseURL)
 	setStringInMap(openaiNode, "model", cfg.Model)
+	setStringMapInMap(openaiNode, "headers", cfg.Headers)
 	if cfg.MaxTotalTokens > 0 {
 		setIntInMap(openaiNode, "max_total_tokens", cfg.MaxTotalTokens)
 	}
@@ -2122,6 +2217,7 @@ func updateAIConfig(doc *yaml.Node, cfg config.AIConfig) {
 		setStringInMap(channelNode, "api_key", ch.APIKey)
 		setStringInMap(channelNode, "base_url", ch.BaseURL)
 		setStringInMap(channelNode, "model", ch.Model)
+		setStringMapInMap(channelNode, "headers", ch.Headers)
 		if ch.MaxTotalTokens > 0 {
 			setIntInMap(channelNode, "max_total_tokens", ch.MaxTotalTokens)
 		}
@@ -2275,6 +2371,8 @@ func updateHitlConfig(doc *yaml.Node, cfg config.HitlConfig) {
 	setStringInMap(auditModelNode, "base_url", cfg.AuditModel.BaseURL)
 	setStringInMap(auditModelNode, "api_key", cfg.AuditModel.APIKey)
 	setStringInMap(auditModelNode, "model", cfg.AuditModel.Model)
+	setStringMapInMap(auditModelNode, "headers", cfg.AuditModel.Headers)
+	setStringInMap(ensureMap(auditModelNode, "reasoning"), "profile", cfg.AuditModel.Reasoning.Profile)
 	// flow 样式 [a, b, c] 单行展示，工具多时比块序列省行数
 	setFlowStringSliceInMap(hitlNode, "tool_whitelist", cfg.ToolWhitelist)
 	setStringInMap(hitlNode, "default_mode", cfg.EffectiveDefaultMode())
@@ -2520,6 +2618,34 @@ func setStringInMap(mapNode *yaml.Node, key, value string) {
 	valueNode.Tag = "!!str"
 	valueNode.Style = 0
 	valueNode.Value = value
+}
+
+// setStringMapInMap 把 map[string]string 写成 YAML 映射节点（键排序，空值删除）。
+func setStringMapInMap(mapNode *yaml.Node, key string, values map[string]string) {
+	if len(values) == 0 {
+		removeKeyFromMap(mapNode, key)
+		return
+	}
+	keys := make([]string, 0, len(values))
+	for k := range values {
+		if strings.TrimSpace(k) == "" {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	if len(keys) == 0 {
+		removeKeyFromMap(mapNode, key)
+		return
+	}
+	sort.Strings(keys)
+	mapValue := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+	for _, k := range keys {
+		mapValue.Content = append(mapValue.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: k},
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: values[k]})
+	}
+	_, valueNode := ensureKeyValue(mapNode, key)
+	*valueNode = *mapValue
 }
 
 func removeKeyFromMap(mapNode *yaml.Node, key string) {

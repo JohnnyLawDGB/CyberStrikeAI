@@ -17,6 +17,7 @@ import (
 	"cyberstrike-ai/internal/database"
 	"cyberstrike-ai/internal/einomcp"
 	"cyberstrike-ai/internal/project"
+	"cyberstrike-ai/internal/projectprompt"
 	"cyberstrike-ai/internal/reasoning"
 	"cyberstrike-ai/internal/security"
 
@@ -222,7 +223,7 @@ func RunDeepAgent(
 
 			subMax := resolveMaxIterations(appCfg, sub.MaxIterations)
 
-			subSumMw, err := newEinoAgenticSummarizationMiddleware(ctx, subModel, appCfg, &ma.EinoMiddleware, conversationID, db, projectID, logger)
+			subSumMw, err := newEinoAgenticSummarizationMiddleware(ctx, subModel, appCfg, &ma.EinoMiddleware, conversationID, db, projectID, logger, "sub/"+id)
 			if err != nil {
 				return nil, fmt.Errorf("子代理 %q agentic summarization 中间件: %w", id, err)
 			}
@@ -252,7 +253,8 @@ func RunDeepAgent(
 				middlewareConfig:     &ma.EinoMiddleware,
 			})
 
-			subInstrFinal := project.AppendVisionImageAnalysisIfReady(instr, appCfg.Vision.Ready())
+			subInstrFinal := project.AppendSystemPromptBlock(instr, projectprompt.UserInteractionContractSection(userMessage))
+			subInstrFinal = project.AppendVisionImageAnalysisIfReady(subInstrFinal, appCfg.Vision.Ready())
 			subInstrFinal = injectToolNamesOnlyInstruction(ctx, subInstrFinal, subTools, subToolSearchActive)
 			if logger != nil {
 				subNames := collectToolNames(ctx, subTools)
@@ -334,6 +336,7 @@ func RunDeepAgent(
 	}
 
 	orchInstruction = project.AppendSystemPromptBlock(orchInstruction, systemPromptExtra)
+	orchInstruction = project.AppendSystemPromptBlock(orchInstruction, projectprompt.UserInteractionContractSection(userMessage))
 	orchInstruction = project.AppendVisionImageAnalysisIfReady(orchInstruction, appCfg.Vision.Ready())
 	orchInstruction = injectToolNamesOnlyInstruction(ctx, orchInstruction, mainTools, mainToolSearchActive)
 	if logger != nil {
@@ -406,7 +409,7 @@ func RunDeepAgent(
 	var taskBlackboardSupplement string
 	if appCfg.Project.Enabled && db != nil {
 		if pid := strings.TrimSpace(projectID); pid != "" {
-			if block, err := project.BuildFactIndexBlock(db, pid, appCfg.Project); err == nil {
+			if block, err := project.BuildFactIndexBlock(db, pid, appCfg.Project, conversationID); err == nil {
 				taskBlackboardSupplement = strings.TrimSpace(block)
 			}
 		}
@@ -488,7 +491,7 @@ func RunDeepAgent(
 		if perr != nil {
 			return nil, fmt.Errorf("plan_execute 执行器 AgenticModel: %w", perr)
 		}
-		planRewriteSumMw, perr := newEinoSummarizationMiddleware(ctx, execModel, appCfg, &ma.EinoMiddleware, conversationID, db, projectID, logger)
+		planRewriteSumMw, perr := newEinoSummarizationMiddleware(ctx, execModel, appCfg, &ma.EinoMiddleware, conversationID, db, projectID, logger, "plan_execute/planning")
 		if perr != nil {
 			return nil, fmt.Errorf("plan_execute planner/replanner summarization: %w", perr)
 		}
@@ -712,7 +715,35 @@ func historyToMessages(history []agent.ChatMessage, appCfg *config.Config, mwCfg
 				if !h.ModelFacingTrace {
 					content = normalizeRestoredUserContent(content, userContentMaxRunes)
 				}
-				raw = append(raw, schema.UserMessage(content))
+				msg := schema.UserMessage(content)
+				if h.SummarizationKind == "summary" || h.SummarizationKind == "skills" {
+					msg.Extra = map[string]interface{}{agent.SummarizationContentTypeKey: h.SummarizationKind}
+				}
+				if agent.IsGeneratedExecutionContext(h.GeneratedContextKind) {
+					if msg.Extra == nil {
+						msg.Extra = make(map[string]interface{})
+					}
+					msg.Extra[agent.GeneratedContextTypeKey] = h.GeneratedContextKind
+				}
+				raw = append(raw, msg)
+			}
+		case "system":
+			// Replay only the host's human ledger, never old system instructions.
+			if len(h.OriginalUserIntentEntries) > 0 {
+				msg := schema.SystemMessage("")
+				msg.Extra = map[string]interface{}{userIntentLedgerExtraKey: h.OriginalUserIntentEntries}
+				maxRunes := config.DefaultSummarizationUserIntentLedgerMaxRunes
+				entryMax := config.DefaultSummarizationUserIntentLedgerEntryMaxRunes
+				if mwCfg != nil {
+					maxRunes = mwCfg.SummarizationUserIntentLedgerMaxRunesEffective()
+					entryMax = mwCfg.SummarizationUserIntentLedgerEntryMaxRunesEffective()
+				}
+				if appCfg != nil {
+					maxRunes = minPositiveInt(maxRunes, modelFacingRuneBudget(appCfg.OpenAI.MaxTotalTokens, 0.20))
+				}
+				if ledger := buildOriginalUserIntentLedgerMessage([]adk.Message{msg}, maxRunes, minPositiveInt(entryMax, maxRunes)); ledger != nil {
+					raw = append(raw, ledger)
+				}
 			}
 		case "assistant":
 			toolSchema := chatToolCallsToSchema(h.ToolCalls)

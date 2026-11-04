@@ -23,6 +23,7 @@ const (
 	ReasonFailed          = "failed"
 	ReasonCancelled       = "cancelled"
 	ReasonMissingEvidence = "missing_execution_evidence"
+	ReasonExecutionFailed = "execution_failed"
 )
 
 // Decision is the single contract that may promote an agent run to a final
@@ -36,8 +37,10 @@ type Decision struct {
 	FinalText            string   `json:"finalText,omitempty"`
 	EvidenceVerified     bool     `json:"evidenceVerified"`
 	EvidenceRefs         []string `json:"evidenceRefs,omitempty"`
+	MCPExecutionIDs      []string `json:"mcpExecutionIds,omitempty"`
 	PendingExecutionIDs  []string `json:"pendingExecutionIds,omitempty"`
 	PendingToolRuns      []string `json:"pendingToolRuns,omitempty"`
+	FailedExecutionIDs   []string `json:"failedExecutionIds,omitempty"`
 	MissingChecks        []string `json:"missingChecks,omitempty"`
 	AgentMode            string   `json:"agentMode,omitempty"`
 	ConversationID       string   `json:"conversationId,omitempty"`
@@ -68,6 +71,7 @@ func FromRunResult(db *database.DB, result *multiagent.RunResult, in Input) Deci
 	}
 	d := Decide(db, in)
 	if result != nil {
+		result.MCPExecutionIDs = append([]string(nil), d.MCPExecutionIDs...)
 		result.Finalized = d.Finalized
 		result.Status = d.Status
 		result.CompletionReason = d.CompletionReason
@@ -80,6 +84,7 @@ func FromRunResult(db *database.DB, result *multiagent.RunResult, in Input) Deci
 }
 
 func Decide(db *database.DB, in Input) Decision {
+	in.MCPExecutionIDs = resolveExecutionIDs(db, in)
 	text := strings.TrimSpace(in.Response)
 	status := strings.TrimSpace(in.Status)
 	if status == "" {
@@ -95,6 +100,7 @@ func Decide(db *database.DB, in Input) Decision {
 		FinalText:            text,
 		EvidenceVerified:     true,
 		EvidenceRefs:         evidenceRefs(in.MCPExecutionIDs),
+		MCPExecutionIDs:      append([]string(nil), in.MCPExecutionIDs...),
 		AgentMode:            strings.TrimSpace(in.AgentMode),
 		ConversationID:       strings.TrimSpace(in.ConversationID),
 		AssistantMessageID:   strings.TrimSpace(in.AssistantMessageID),
@@ -138,10 +144,17 @@ func Decide(db *database.DB, in Input) Decision {
 	}
 
 	if in.RequireExecutionEvidence && !hasCompletedEvidence(db, in.MCPExecutionIDs) {
+		d.EvidenceVerified = false
+		d.FailedExecutionIDs = failedExecutionIDs(db, in.MCPExecutionIDs)
+		if len(d.FailedExecutionIDs) > 0 {
+			d.Status = StatusFailed
+			d.CompletionReason = ReasonExecutionFailed
+			d.MissingChecks = append(d.MissingChecks, "tool execution evidence was recorded, but no execution completed successfully")
+			return d
+		}
 		d.Status = StatusBlocked
 		d.CompletionReason = ReasonMissingEvidence
-		d.EvidenceVerified = false
-		d.MissingChecks = append(d.MissingChecks, "execution evidence is required but no completed tool execution was recorded")
+		d.MissingChecks = append(d.MissingChecks, "execution evidence is required, but no concrete tool execution was recorded")
 		return d
 	}
 
@@ -162,8 +175,10 @@ func ResponsePayload(d Decision, extra map[string]interface{}) map[string]interf
 		"completionReason":    d.CompletionReason,
 		"evidenceVerified":    d.EvidenceVerified,
 		"evidenceRefs":        d.EvidenceRefs,
+		"mcpExecutionIds":     d.MCPExecutionIDs,
 		"pendingExecutionIds": d.PendingExecutionIDs,
 		"pendingToolRuns":     d.PendingToolRuns,
+		"failedExecutionIds":  d.FailedExecutionIDs,
 		"missingChecks":       d.MissingChecks,
 	}
 	if d.ConversationID != "" {
@@ -177,6 +192,35 @@ func ResponsePayload(d Decision, extra map[string]interface{}) map[string]interf
 	}
 	for k, v := range extra {
 		out[k] = v
+	}
+	return out
+}
+
+func resolveExecutionIDs(db *database.DB, in Input) []string {
+	ids := uniqueExecutionIDs(in.MCPExecutionIDs)
+	if db == nil || strings.TrimSpace(in.ConversationID) == "" || strings.TrimSpace(in.AssistantMessageID) == "" {
+		return ids
+	}
+	persisted, err := db.ListToolExecutionIDsForMessageTurn(in.ConversationID, in.AssistantMessageID)
+	if err != nil {
+		return ids
+	}
+	return uniqueExecutionIDs(append(ids, persisted...))
+}
+
+func uniqueExecutionIDs(ids []string) []string {
+	out := make([]string, 0, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
 	}
 	return out
 }
@@ -257,4 +301,26 @@ func hasCompletedEvidence(db *database.DB, ids []string) bool {
 		}
 	}
 	return false
+}
+
+func failedExecutionIDs(db *database.DB, ids []string) []string {
+	if db == nil || len(ids) == 0 {
+		return nil
+	}
+	out := make([]string, 0)
+	for _, id := range uniqueExecutionIDs(ids) {
+		exec, err := db.GetToolExecution(id)
+		if err != nil || exec == nil {
+			continue
+		}
+		switch strings.TrimSpace(exec.Status) {
+		case mcp.ToolExecutionStatusFailed,
+			mcp.ToolExecutionStatusBlocked,
+			mcp.ToolExecutionStatusCancelled,
+			mcp.ToolExecutionStatusHardTimeout,
+			mcp.ToolExecutionStatusOrphaned:
+			out = append(out, id)
+		}
+	}
+	return out
 }

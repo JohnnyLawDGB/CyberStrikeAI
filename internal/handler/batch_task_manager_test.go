@@ -2,6 +2,7 @@ package handler
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"go.uber.org/zap"
@@ -129,5 +130,48 @@ func TestTryMarkQueueExecutorDedupes(t *testing.T) {
 	m.UnmarkQueueExecutor("q-1")
 	if !m.TryMarkQueueExecutor("q-1") {
 		t.Fatal("mark after unmark should succeed")
+	}
+}
+
+func TestPrepareManualBatchQueueStartResetsCompletedQueue(t *testing.T) {
+	t.Parallel()
+	m := NewBatchTaskManager(zap.NewNop())
+	queue, err := m.CreateBatchQueue("test", "", "eino_single", "manual", "", "", nil, 1, []string{"hello"})
+	if err != nil {
+		t.Fatalf("CreateBatchQueue: %v", err)
+	}
+	taskID := queue.Tasks[0].ID
+	m.UpdateTaskStatus(queue.ID, taskID, BatchTaskStatusCompleted, "old result", "")
+	m.UpdateQueueStatus(queue.ID, BatchQueueStatusCompleted)
+
+	h := &AgentHandler{batchTaskManager: m}
+	prepared, err := h.prepareManualBatchQueueStart(queue.ID, queue)
+	if err != nil {
+		t.Fatalf("prepareManualBatchQueueStart: %v", err)
+	}
+	if prepared.Status != BatchQueueStatusPending {
+		t.Fatalf("expected queue status %q, got %q", BatchQueueStatusPending, prepared.Status)
+	}
+	if prepared.CurrentIndex != 0 || prepared.StartedAt != nil || prepared.CompletedAt != nil {
+		t.Fatalf("expected queue run metadata to be reset: %#v", prepared)
+	}
+	if got := prepared.Tasks[0]; got.Status != BatchTaskStatusPending || got.Result != "" || got.Error != "" || got.ConversationID != "" {
+		t.Fatalf("expected task to be reset, got %#v", got)
+	}
+}
+
+func TestPrepareManualBatchQueueStartRejectsUnknownState(t *testing.T) {
+	t.Parallel()
+	m := NewBatchTaskManager(zap.NewNop())
+	queue, err := m.CreateBatchQueue("test", "", "eino_single", "manual", "", "", nil, 1, []string{"hello"})
+	if err != nil {
+		t.Fatalf("CreateBatchQueue: %v", err)
+	}
+	queue.Status = "stuck"
+
+	h := &AgentHandler{batchTaskManager: m}
+	_, err = h.prepareManualBatchQueueStart(queue.ID, queue)
+	if err == nil || !strings.Contains(err.Error(), `"stuck"`) {
+		t.Fatalf("expected status-specific error, got %v", err)
 	}
 }

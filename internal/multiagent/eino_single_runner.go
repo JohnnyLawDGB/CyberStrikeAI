@@ -10,6 +10,7 @@ import (
 	"cyberstrike-ai/internal/database"
 	"cyberstrike-ai/internal/einomcp"
 	"cyberstrike-ai/internal/project"
+	"cyberstrike-ai/internal/projectprompt"
 	"cyberstrike-ai/internal/reasoning"
 
 	"github.com/cloudwego/eino/adk"
@@ -156,6 +157,7 @@ func RunEinoSingleChatModelAgent(
 		EmitInternalEvents: true,
 	}
 	ins := project.AppendSystemPromptBlock(ag.EinoSingleAgentSystemInstruction(), systemPromptExtra)
+	ins = project.AppendSystemPromptBlock(ins, projectprompt.UserInteractionContractSection(userMessage))
 	ins = project.AppendVisionImageAnalysisIfReady(ins, appCfg.Vision.Ready())
 	ins = injectToolNamesOnlyInstruction(ctx, ins, mainTools, singleToolSearchActive)
 	if logger != nil {

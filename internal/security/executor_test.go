@@ -50,6 +50,88 @@ func TestExecutor_ExecuteInternalTool_UnknownTool(t *testing.T) {
 	}
 }
 
+func TestExecutor_RegisterToolsSkipsUnavailableCommands(t *testing.T) {
+	logger := zap.NewNop()
+	server := mcp.NewServer(logger)
+	cfg := &config.SecurityConfig{Tools: []config.ToolConfig{
+		{Name: "available", Command: "sh", Enabled: true},
+		{Name: "missing", Command: "cyberstrike-definitely-not-installed", Enabled: true},
+		{Name: "internal", Command: "internal:test", Enabled: true},
+		{Name: "disabled", Command: "sh", Enabled: false},
+	}}
+	executor := NewExecutor(cfg, server, logger)
+	executor.RegisterTools(server)
+
+	names := make(map[string]bool)
+	for _, tool := range server.GetAllTools() {
+		names[tool.Name] = true
+	}
+	if !names["available"] || !names["internal"] {
+		t.Fatalf("available tools were not registered: %v", names)
+	}
+	if names["missing"] || names["disabled"] {
+		t.Fatalf("unavailable or disabled tools must not be registered: %v", names)
+	}
+	if _, ok := executor.toolIndex["missing"]; ok {
+		t.Fatal("unavailable command must not remain in the executable tool index")
+	}
+}
+
+func TestValidateToolArgumentsRejectsMissingAndPlaceholderInputs(t *testing.T) {
+	pos0 := 0
+	toolConfig := &config.ToolConfig{
+		Name:    "scanner",
+		Command: "sh",
+		Parameters: []config.ParameterConfig{
+			{Name: "target", Type: "string", Required: true, Position: &pos0, Format: "positional"},
+		},
+	}
+
+	for name, args := range map[string]map[string]interface{}{
+		"missing":        {},
+		"angle":          {"target": "<target_ip_address>"},
+		"your target":    {"target": "<your_target>"},
+		"example host":   {"target": "https://target.com/FUZZ"},
+		"template value": {"target": "{{ target }}"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := validateToolArguments(toolConfig, args); err == nil {
+				t.Fatalf("expected invalid arguments for %#v", args)
+			}
+		})
+	}
+
+	if err := validateToolArguments(toolConfig, map[string]interface{}{"target": "https://digibyte.org/FUZZ"}); err != nil {
+		t.Fatalf("concrete ffuf-style target should be accepted: %v", err)
+	}
+}
+
+func TestExecutorRejectsPlaceholderBeforeStartingCommand(t *testing.T) {
+	pos0 := 0
+	logger := zap.NewNop()
+	server := mcp.NewServer(logger)
+	cfg := &config.SecurityConfig{Tools: []config.ToolConfig{{
+		Name:    "scanner",
+		Command: "sh",
+		Enabled: true,
+		Parameters: []config.ParameterConfig{
+			{Name: "target", Type: "string", Required: true, Position: &pos0, Format: "positional"},
+		},
+	}}}
+	executor := NewExecutor(cfg, server, logger)
+
+	result, err := executor.ExecuteTool(context.Background(), "scanner", map[string]interface{}{"target": "<target>"})
+	if err != nil {
+		t.Fatalf("ExecuteTool: %v", err)
+	}
+	if result == nil || !result.IsError {
+		t.Fatalf("placeholder input should return a soft tool error: %#v", result)
+	}
+	if body := mcp.ToolResultPlainText(result); !strings.Contains(body, "unresolved placeholder") {
+		t.Fatalf("placeholder error should be actionable, got %q", body)
+	}
+}
+
 func TestExecuteSystemCommand_BackgroundDoesNotBlockOnChildStdout(t *testing.T) {
 	executor, _ := setupTestExecutor(t)
 	// 子进程先向 stdout 写无换行字符再长时间 sleep；若与 echo $pid 共享管道且未重定向子进程 stdout，

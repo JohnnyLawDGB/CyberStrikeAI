@@ -147,6 +147,8 @@ func RegisterBatchTaskMCPTools(mcpServer *mcp.Server, h *AgentHandler, logger *z
 
 【参数】tasks（字符串数组）或 tasks_text（多行，每行一条）二选一；每项是一条将来由系统按队列顺序执行的指令文案。agent_mode：eino_single（Eino ADK 单代理，默认）、deep / plan_execute / supervisor（需系统启用多代理）。非”把主对话拆给子代理”。schedule_mode：manual（默认）或 cron；cron 须填 cron_expr（5 段，如 “0 */6 * * *”）。
 
+【子任务质量要求】每条任务必须自包含，并写入具体、真实、已获授权的目标及执行所需输入。禁止使用 <target>、target.com、target.local、your_target 等占位符或示例值；禁止仅因工具存在就创建不适用的任务。需要本地仓库/镜像/IaC 目录、二进制、哈希文件、AD 域/域控/凭据或其他工件的工具，只有在这些具体输入已经存在时才能排入队列。若前置条件未知，应先创建信息收集/确认任务，或向用户询问，不要创建注定无法执行的工具任务。
+
 【执行】默认创建后为 pending，不自动跑。execute_now=true 可创建后立即跑；否则之后调用 batch_task_start。Cron 自动下一轮需 schedule_enabled 为 true（可用 batch_task_schedule_enabled）。`,
 		ShortDescription: "任务管理：创建批量任务队列（登记多条指令，可选立即或 Cron）",
 		InputSchema: map[string]interface{}{
@@ -162,12 +164,12 @@ func RegisterBatchTaskMCPTools(mcpServer *mcp.Server, h *AgentHandler, logger *z
 				},
 				"tasks": map[string]interface{}{
 					"type":        "array",
-					"description": "队列中的子任务指令，每项一条独立待执行文案（与 tasks_text 二选一）",
+					"description": "队列中的子任务指令，每项必须自包含具体目标与所需输入，不得含占位符或缺失工件（与 tasks_text 二选一）",
 					"items":       map[string]interface{}{"type": "string"},
 				},
 				"tasks_text": map[string]interface{}{
 					"type":        "string",
-					"description": "多行文本，每行一条子任务指令（与 tasks 二选一）",
+					"description": "多行文本，每行一条自包含、可立即执行且不含占位符的子任务指令（与 tasks 二选一）",
 				},
 				"agent_mode": map[string]interface{}{
 					"type":        "string",
@@ -270,11 +272,11 @@ func RegisterBatchTaskMCPTools(mcpServer *mcp.Server, h *AgentHandler, logger *z
 	// --- start ---
 	reg(mcp.Tool{
 		Name: builtin.ToolBatchTaskStart,
-		Description: `启动或继续执行批量任务队列（pending / paused）。
+		Description: `启动、继续或重新执行批量任务队列。pending / paused 队列会直接开始或继续；completed / cancelled 队列会先安全重置全部子任务，再开始新一轮执行。
 与 batch_task_create 配合使用：仅创建队列不会自动执行，需调用本工具才会开始跑子任务。
 
 ⚠️ 调用约束：本工具属于「任务管理」模块，仅当用户明确要求启动/继续批量任务时才可调用。不要在用户未要求时自行调用。`,
-		ShortDescription: "启动/继续批量任务队列（创建后需调用才会执行）",
+		ShortDescription: "启动/继续队列；已结束队列会重置后重跑",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -562,7 +564,7 @@ schedule_mode 为 cron 时必须提供有效 cron_expr；为 manual 时会清除
 	// --- add task ---
 	reg(mcp.Tool{
 		Name:             builtin.ToolBatchTaskAdd,
-		Description:      "向处于 pending 状态的队列追加一条子任务。\n\n⚠️ 调用约束：本工具属于「任务管理」模块，仅当用户明确要求向批量任务队列添加子任务时才可调用。不要在用户未要求时自行调用。",
+		Description:      "向处于 pending 状态的队列追加一条子任务。任务必须自包含具体、真实的目标与所需输入，不得使用占位符，也不得安排缺少仓库、镜像、二进制、哈希文件、AD 环境或凭据等前置条件的工具。\n\n⚠️ 调用约束：本工具属于「任务管理」模块，仅当用户明确要求向批量任务队列添加子任务时才可调用。不要在用户未要求时自行调用。",
 		ShortDescription: "批量队列添加子任务",
 		InputSchema: map[string]interface{}{
 			"type": "object",
